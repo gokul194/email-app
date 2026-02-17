@@ -10,14 +10,15 @@ import type {
 
 /**
  * Lightweight index entry — stores only the byte offset + length of each
- * message inside the MBOX file.  The actual message content is read on
- * demand, keeping memory usage minimal even for multi-GB files.
+ * message inside the MBOX file, plus Gmail labels for folder reconstruction.
  */
 interface MessageIndex {
   /** Byte offset of the first header line (after the "From " envelope line) */
   offset: number;
   /** Byte length of the raw RFC 2822 message */
   length: number;
+  /** Gmail labels extracted from X-Gmail-Labels header */
+  labels: string[];
 }
 
 /**
@@ -31,14 +32,15 @@ interface MboxSession {
   filePath: string;
   /** Byte-offset index of every message (built once during open) */
   messageIndex: MessageIndex[];
+  /** Map from folderId → array of global message indices in that folder */
+  folderMessageMap: Map<string, number[]>;
   /** Cached summaries – populated lazily as pages are requested */
   summaryCache: Map<number, CachedSummary>;
   /** Cached full parses – populated on demand for detail views */
   detailCache: Map<number, ParsedEmail>;
   folders: PstFolder[];
-  folderName: string;
-  /** How many summaries have been loaded so far (sequential) */
-  loadedUpTo: number;
+  /** Per-folder: how many summaries have been loaded sequentially */
+  folderLoadedUpTo: Map<string, number>;
 }
 
 interface ParsedEmail {
@@ -101,51 +103,41 @@ function buildMessageIndex(filePath: string): MessageIndex[] {
   const buf = Buffer.alloc(CHUNK_SIZE);
 
   const marker = Buffer.from('\nFrom ');
-  const markerStart = Buffer.from('From '); // for very first message at offset 0
 
   /** Byte offsets of each "From " envelope line */
   const envelopeOffsets: number[] = [];
 
   let bytesRead = 0;
   let filePos = 0;
-  // We need to handle markers that span chunk boundaries.
-  // Keep the last (marker.length - 1) bytes of the previous chunk.
   let overlap = Buffer.alloc(0);
 
   while (filePos < fileSize) {
     const toRead = Math.min(CHUNK_SIZE, fileSize - filePos);
     bytesRead = fs.readSync(fd, buf, 0, toRead, filePos);
 
-    // Combine overlap from previous chunk with current chunk for boundary scanning
     const scanBuf = overlap.length > 0
       ? Buffer.concat([overlap, buf.subarray(0, bytesRead)])
       : buf.subarray(0, bytesRead);
 
-    const scanOffset = filePos - overlap.length; // absolute file offset of scanBuf[0]
+    const scanOffset = filePos - overlap.length;
 
     // Check for "From " at the very start of the file
     if (filePos === 0 && scanBuf.length >= 5) {
-      if (scanBuf[0] === 0x46 && // F
-          scanBuf[1] === 0x72 && // r
-          scanBuf[2] === 0x6f && // o
-          scanBuf[3] === 0x6d && // m
-          scanBuf[4] === 0x20) { // space
+      if (scanBuf[0] === 0x46 && scanBuf[1] === 0x72 &&
+          scanBuf[2] === 0x6f && scanBuf[3] === 0x6d && scanBuf[4] === 0x20) {
         envelopeOffsets.push(0);
       }
     }
 
-    // Search for "\nFrom " within the scan buffer
     let searchStart = (filePos === 0 && overlap.length === 0) ? 1 : 0;
     while (searchStart <= scanBuf.length - marker.length) {
       const idx = scanBuf.indexOf(marker, searchStart);
       if (idx === -1) break;
-      // The "\nFrom " was found; the envelope line starts at idx + 1
-      const absOffset = scanOffset + idx + 1; // points to "From "
+      const absOffset = scanOffset + idx + 1;
       envelopeOffsets.push(absOffset);
       searchStart = idx + marker.length;
     }
 
-    // Keep overlap for next iteration
     const overlapSize = Math.min(marker.length - 1, bytesRead);
     overlap = Buffer.from(buf.subarray(bytesRead - overlapSize, bytesRead));
 
@@ -154,23 +146,220 @@ function buildMessageIndex(filePath: string): MessageIndex[] {
 
   fs.closeSync(fd);
 
-  // Now convert envelope offsets → message body offsets + lengths
+  // Convert envelope offsets → message entries with labels
   const index: MessageIndex[] = [];
+  const headerBuf = Buffer.alloc(4096); // reusable buffer for header reading
+
   for (let i = 0; i < envelopeOffsets.length; i++) {
-    // Find end of the "From " envelope line (first \n after envelope offset)
     const envOffset = envelopeOffsets[i];
     const headerStart = findNewlineAfter(filePath, envOffset) + 1;
     const nextEnv = i + 1 < envelopeOffsets.length
       ? envelopeOffsets[i + 1]
       : fileSize;
-    // The message body goes from headerStart to (nextEnv - 1) — skip trailing \n
     const length = nextEnv - headerStart;
-    if (length > 0) {
-      index.push({ offset: headerStart, length });
-    }
+    if (length <= 0) continue;
+
+    // Read first 4KB to extract Gmail labels during indexing
+    const readSize = Math.min(4096, length);
+    const hfd = fs.openSync(filePath, 'r');
+    fs.readSync(hfd, headerBuf, 0, readSize, headerStart);
+    fs.closeSync(hfd);
+
+    const headerStr = headerBuf.subarray(0, readSize).toString('utf-8');
+    const labels = extractGmailLabels(headerStr);
+
+    index.push({ offset: headerStart, length, labels });
   }
 
   return index;
+}
+
+/**
+ * Extract Gmail labels from X-Gmail-Labels header in a raw header string.
+ * Gmail Takeout includes: X-Gmail-Labels: Inbox,Important,Category Updates
+ * Labels can be quoted if they contain commas: "Label, with comma"
+ */
+function extractGmailLabels(headerStr: string): string[] {
+  // Match X-Gmail-Labels header (may span multiple lines with folding)
+  const match = headerStr.match(/^X-Gmail-Labels:\s*(.+(?:\r?\n[ \t]+.+)*)/mi);
+  if (!match) return [];
+
+  const rawValue = match[1].replace(/\r?\n\s+/g, ' ').trim();
+  if (!rawValue) return [];
+
+  // Parse comma-separated labels, respecting quoted strings
+  const labels: string[] = [];
+  let current = '';
+  let inQuote = false;
+
+  for (let i = 0; i < rawValue.length; i++) {
+    const ch = rawValue[i];
+    if (ch === '"') {
+      inQuote = !inQuote;
+    } else if (ch === ',' && !inQuote) {
+      const trimmed = current.trim();
+      if (trimmed) labels.push(trimmed);
+      current = '';
+    } else {
+      current += ch;
+    }
+  }
+  const lastTrimmed = current.trim();
+  if (lastTrimmed) labels.push(lastTrimmed);
+
+  return labels;
+}
+
+/**
+ * Normalize a Gmail label into a cleaner display name.
+ * E.g. "Category Promotions" → "Promotions" (under Category parent)
+ */
+function normalizeLabel(label: string): string {
+  return label.trim();
+}
+
+/**
+ * Known Gmail system label display order.
+ */
+const GMAIL_LABEL_ORDER: Record<string, number> = {
+  'Inbox': 0,
+  'Starred': 1,
+  'Important': 2,
+  'Sent': 3,
+  'Drafts': 4,
+  'Spam': 5,
+  'Trash': 6,
+  'Chats': 7,
+};
+
+/**
+ * Build folder tree from Gmail labels found across all messages.
+ * Creates nested folders for labels with "/" separator (e.g. "Work/Projects").
+ * Groups "Category *" labels under a "Categories" parent.
+ */
+function buildFolderTree(
+  messageIndex: MessageIndex[]
+): { folders: PstFolder[]; folderMessageMap: Map<string, number[]> } {
+  // Count messages per label and build label → message index mapping
+  const labelCounts = new Map<string, number>();
+  const labelMessages = new Map<string, number[]>();
+
+  for (let i = 0; i < messageIndex.length; i++) {
+    const labels = messageIndex[i].labels;
+    if (labels.length === 0) {
+      // Messages without labels go to "All Mail"
+      const key = 'All Mail';
+      labelCounts.set(key, (labelCounts.get(key) || 0) + 1);
+      if (!labelMessages.has(key)) labelMessages.set(key, []);
+      labelMessages.get(key)!.push(i);
+    }
+    for (const label of labels) {
+      const normalized = normalizeLabel(label);
+      if (!normalized) continue;
+      labelCounts.set(normalized, (labelCounts.get(normalized) || 0) + 1);
+      if (!labelMessages.has(normalized)) labelMessages.set(normalized, []);
+      labelMessages.get(normalized)!.push(i);
+    }
+  }
+
+  // Also add an "All Mail" entry with ALL messages
+  if (!labelMessages.has('All Mail')) {
+    labelMessages.set('All Mail', []);
+  }
+  const allMailList = labelMessages.get('All Mail')!;
+  // If we only collected unlabeled messages above, now collect ALL
+  // Always provide All Mail with every message
+  allMailList.length = 0;
+  for (let i = 0; i < messageIndex.length; i++) {
+    allMailList.push(i);
+  }
+  labelCounts.set('All Mail', messageIndex.length);
+
+  // Build flat folders first, then organize into tree
+  const topLevel: PstFolder[] = [];
+  const categoryChildren: PstFolder[] = [];
+  const nestedFolders = new Map<string, PstFolder>(); // parent path → folder
+  const processedLabels = new Set<string>();
+
+  // Sort labels: system labels first (in Gmail order), then alphabetical
+  const sortedLabels = [...labelCounts.keys()].sort((a, b) => {
+    const orderA = GMAIL_LABEL_ORDER[a] ?? 999;
+    const orderB = GMAIL_LABEL_ORDER[b] ?? 999;
+    if (orderA !== orderB) return orderA - orderB;
+    return a.localeCompare(b);
+  });
+
+  for (const label of sortedLabels) {
+    if (processedLabels.has(label)) continue;
+    processedLabels.add(label);
+
+    const count = labelCounts.get(label) || 0;
+
+    // Handle "Category *" labels → group under Categories parent
+    if (label.startsWith('Category ')) {
+      const catName = label.substring('Category '.length);
+      categoryChildren.push({
+        id: label,
+        name: catName,
+        messageCount: count,
+        children: [],
+      });
+      continue;
+    }
+
+    // Handle nested labels with "/" separator (e.g. "Work/Projects/Active")
+    if (label.includes('/')) {
+      const parts = label.split('/');
+      let currentPath = '';
+      let parentChildren = topLevel;
+
+      for (let p = 0; p < parts.length; p++) {
+        const partName = parts[p];
+        currentPath = currentPath ? `${currentPath}/${partName}` : partName;
+
+        let existing = nestedFolders.get(currentPath);
+        if (!existing) {
+          const isLeaf = p === parts.length - 1;
+          existing = {
+            id: currentPath,
+            name: partName,
+            messageCount: isLeaf ? count : (labelCounts.get(currentPath) || 0),
+            children: [],
+          };
+          nestedFolders.set(currentPath, existing);
+          parentChildren.push(existing);
+
+          // If intermediate path also has messages, register it
+          if (!isLeaf && labelMessages.has(currentPath)) {
+            // already handled by the folder
+          }
+        }
+        parentChildren = existing.children;
+      }
+      continue;
+    }
+
+    // Regular top-level label
+    const folder: PstFolder = {
+      id: label,
+      name: label,
+      messageCount: count,
+      children: [],
+    };
+    topLevel.push(folder);
+  }
+
+  // Add Categories parent if there are category labels
+  if (categoryChildren.length > 0) {
+    topLevel.push({
+      id: '__categories__',
+      name: 'Categories',
+      messageCount: 0,
+      children: categoryChildren,
+    });
+  }
+
+  return { folders: topLevel, folderMessageMap: labelMessages };
 }
 
 /**
@@ -186,7 +375,7 @@ function findNewlineAfter(filePath: string, startOffset: number): number {
     const toRead = Math.min(512, fileSize - pos);
     fs.readSync(fd, smallBuf, 0, toRead, pos);
     for (let i = 0; i < toRead; i++) {
-      if (smallBuf[i] === 0x0a) { // \n
+      if (smallBuf[i] === 0x0a) {
         fs.closeSync(fd);
         return pos + i;
       }
@@ -255,7 +444,6 @@ function parseHeadersOnly(raw: string): {
   preview: string;
   hasAttachments: boolean;
 } {
-  // Split headers from body at first blank line
   const blankLineIdx = raw.indexOf('\r\n\r\n');
   const blankLineIdx2 = raw.indexOf('\n\n');
   let headerEnd = -1;
@@ -272,7 +460,6 @@ function parseHeadersOnly(raw: string): {
     ? raw.substring(headerEnd).replace(/^\r?\n\r?\n/, '')
     : '';
 
-  // Parse key headers using regex (fast, no full MIME parsing)
   const getHeader = (name: string): string => {
     const regex = new RegExp(`^${name}:\\s*(.+(?:\\r?\\n[ \\t]+.+)*)`, 'mi');
     const match = headers.match(regex);
@@ -284,7 +471,6 @@ function parseHeadersOnly(raw: string): {
   const dateRaw = getHeader('Date');
   const contentType = getHeader('Content-Type');
 
-  // Parse From header
   let senderName = '';
   let senderEmail = '';
   const fromMatch = fromRaw.match(/^"?([^"<]*?)"?\s*<([^>]+)>/);
@@ -295,7 +481,6 @@ function parseHeadersOnly(raw: string): {
     senderEmail = fromRaw.trim();
   }
 
-  // Parse date
   let date = '';
   if (dateRaw) {
     try {
@@ -305,8 +490,6 @@ function parseHeadersOnly(raw: string): {
     }
   }
 
-  // Quick preview from body (first 200 chars of plain text portion)
-  // Strip common MIME boundaries/headers from the preview
   let preview = bodyStart
     .replace(/^--[^\n]+\n/gm, '')
     .replace(/^Content-[^\n]+\n/gm, '')
@@ -334,89 +517,140 @@ export async function openMboxFile(filePath: string, originalFilename?: string):
 
   const messageIndex = buildMessageIndex(filePath);
 
-  const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-  console.log(`[MBOX] Indexed ${messageIndex.length} messages in ${elapsed}s`);
+  const indexElapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+  console.log(`[MBOX] Indexed ${messageIndex.length} messages in ${indexElapsed}s`);
 
-  const sessionId = uuidv4();
-  const nameSource = originalFilename || filePath;
-  const folderName = nameSource
-    .replace(/\\/g, '/')
-    .split('/')
-    .pop()
-    ?.replace(/\.mbox$/i, '') || 'Inbox';
+  // Check if this is a Gmail Takeout export (has X-Gmail-Labels)
+  const hasGmailLabels = messageIndex.some(m => m.labels.length > 0);
 
-  const folders: PstFolder[] = [
-    {
+  let folders: PstFolder[];
+  let folderMessageMap: Map<string, number[]>;
+
+  if (hasGmailLabels) {
+    console.log(`[MBOX] Gmail labels detected — building folder tree...`);
+    const result = buildFolderTree(messageIndex);
+    folders = result.folders;
+    folderMessageMap = result.folderMessageMap;
+    const labelCount = folderMessageMap.size;
+    console.log(`[MBOX] Built ${labelCount} label folders`);
+  } else {
+    // No Gmail labels — single folder like before
+    const nameSource = originalFilename || filePath;
+    const folderName = nameSource
+      .replace(/\\/g, '/')
+      .split('/')
+      .pop()
+      ?.replace(/\.mbox$/i, '') || 'Inbox';
+
+    folders = [{
       id: folderName,
       name: folderName,
       messageCount: messageIndex.length,
       children: [],
-    },
-  ];
+    }];
+
+    folderMessageMap = new Map();
+    const allIndices: number[] = [];
+    for (let i = 0; i < messageIndex.length; i++) allIndices.push(i);
+    folderMessageMap.set(folderName, allIndices);
+  }
+
+  const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+  console.log(`[MBOX] Ready in ${elapsed}s — ${messageIndex.length} messages, ${folders.length} top-level folders`);
+
+  const sessionId = uuidv4();
 
   mboxSessions.set(sessionId, {
     filePath,
     messageIndex,
+    folderMessageMap,
     summaryCache: new Map(),
     detailCache: new Map(),
     folders,
-    folderName,
-    loadedUpTo: 0,
+    folderLoadedUpTo: new Map(),
   });
 
   return { sessionId, folders };
 }
 
 /**
- * Ensure we have summaries loaded up to `needed` messages.
- * Loads in batch using header-only parsing for speed.
+ * Ensure we have summaries loaded for messages in a specific folder
+ * up to `needed` count.
  */
-async function ensureSummariesLoaded(session: MboxSession, needed: number): Promise<void> {
-  const effectiveNeeded = Math.min(needed, session.messageIndex.length);
+async function ensureFolderSummariesLoaded(
+  session: MboxSession,
+  folderId: string,
+  needed: number
+): Promise<void> {
+  const folderIndices = session.folderMessageMap.get(folderId);
+  if (!folderIndices) return;
 
-  if (session.loadedUpTo >= effectiveNeeded) return;
+  const effectiveNeeded = Math.min(needed, folderIndices.length);
+  const currentLoaded = session.folderLoadedUpTo.get(folderId) || 0;
 
-  const BATCH_SIZE = 100; // parse headers in batches
-  let current = session.loadedUpTo;
+  if (currentLoaded >= effectiveNeeded) return;
 
-  while (current < effectiveNeeded) {
-    const batchEnd = Math.min(current + BATCH_SIZE, effectiveNeeded);
+  for (let fi = currentLoaded; fi < effectiveNeeded; fi++) {
+    const globalIdx = folderIndices[fi];
+    if (session.summaryCache.has(globalIdx)) continue;
 
-    for (let i = current; i < batchEnd; i++) {
-      if (session.summaryCache.has(i)) {
-        continue;
-      }
-      const entry = session.messageIndex[i];
-      // Read only the first ~4KB of each message for header parsing
-      const fd = fs.openSync(session.filePath, 'r');
-      const headerBufSize = Math.min(4096, entry.length);
-      const headerBuf = Buffer.alloc(headerBufSize);
-      fs.readSync(fd, headerBuf, 0, headerBufSize, entry.offset);
-      fs.closeSync(fd);
+    const entry = session.messageIndex[globalIdx];
 
-      const partialRaw = headerBuf.toString('utf-8');
+    // Read enough of the message for postal-mime to parse headers + start of body.
+    // We read up to 16KB so postal-mime can decode MIME-encoded headers properly.
+    const readSize = Math.min(16384, entry.length);
+    const fd = fs.openSync(session.filePath, 'r');
+    const headerBuf = Buffer.alloc(readSize);
+    fs.readSync(fd, headerBuf, 0, readSize, entry.offset);
+    fs.closeSync(fd);
+
+    const partialRaw = headerBuf.toString('utf-8');
+
+    let subject = '(No Subject)';
+    let senderName = '';
+    let senderEmail = '';
+    let date = '';
+    let preview = '';
+    let hasAttachments = false;
+
+    try {
+      const parser = new PostalMime();
+      const parsed = await parser.parse(partialRaw);
+      subject = parsed.subject || '(No Subject)';
+      const from = formatAddress(parsed.from as any);
+      senderName = from.name;
+      senderEmail = from.email;
+      date = parsed.date ? new Date(parsed.date).toISOString() : '';
+      preview = (parsed.text || '').slice(0, 200).replace(/\r?\n/g, ' ');
+      hasAttachments = (parsed.attachments || []).length > 0;
+    } catch {
+      // Fall back to raw header parsing if postal-mime fails
       const info = parseHeadersOnly(partialRaw);
-
-      const summary: CachedSummary = {
-        _parsed: true,
-        id: `${session.folderName}::${i}`,
-        folderId: session.folderName,
-        subject: info.subject,
-        senderName: info.senderName,
-        senderEmail: info.senderEmail,
-        receivedDate: info.date,
-        isRead: true,
-        hasAttachments: info.hasAttachments,
-        preview: info.preview,
-      };
-
-      session.summaryCache.set(i, summary);
+      subject = info.subject;
+      senderName = info.senderName;
+      senderEmail = info.senderEmail;
+      date = info.date;
+      preview = info.preview;
+      hasAttachments = info.hasAttachments;
     }
 
-    current = batchEnd;
+    const summary: CachedSummary = {
+      _parsed: true,
+      id: `${folderId}::${globalIdx}`,
+      folderId,
+      subject,
+      senderName,
+      senderEmail,
+      receivedDate: date,
+      isRead: true,
+      hasAttachments,
+      preview,
+    };
+
+    session.summaryCache.set(globalIdx, summary);
   }
 
-  session.loadedUpTo = Math.max(session.loadedUpTo, effectiveNeeded);
+  session.folderLoadedUpTo.set(folderId, effectiveNeeded);
 }
 
 export async function getMboxMessages(
@@ -426,16 +660,23 @@ export async function getMboxMessages(
   limit = 50
 ): Promise<{ messages: EmailSummary[]; total: number }> {
   const session = getMboxSession(sessionId);
-  const total = session.messageIndex.length;
+  const folderIndices = session.folderMessageMap.get(folderId);
 
+  if (!folderIndices) {
+    return { messages: [], total: 0 };
+  }
+
+  const total = folderIndices.length;
   const needed = Math.min(offset + limit, total);
-  await ensureSummariesLoaded(session, needed);
+  await ensureFolderSummariesLoaded(session, folderId, needed);
 
   const messages: EmailSummary[] = [];
-  for (let i = offset; i < Math.min(offset + limit, total); i++) {
-    const cached = session.summaryCache.get(i);
+  for (let fi = offset; fi < Math.min(offset + limit, total); fi++) {
+    const globalIdx = folderIndices[fi];
+    const cached = session.summaryCache.get(globalIdx);
     if (cached) {
-      messages.push(cached);
+      // Return with the correct folderId for this context
+      messages.push({ ...cached, folderId, id: `${folderId}::${globalIdx}` });
     }
   }
 
@@ -447,18 +688,18 @@ export async function getMboxMessageDetail(
   messageId: string
 ): Promise<EmailDetail> {
   const session = getMboxSession(sessionId);
-  const index = parseInt(messageId.split('::')[1], 10);
-  const folderId = messageId.split('::')[0];
+  const parts = messageId.split('::');
+  const folderId = parts[0];
+  const globalIdx = parseInt(parts[1], 10);
 
-  // Check detail cache first
-  let parsed = session.detailCache.get(index);
+  let parsed = session.detailCache.get(globalIdx);
   if (!parsed) {
-    const entry = session.messageIndex[index];
+    const entry = session.messageIndex[globalIdx];
     if (!entry) throw new Error(`Message not found: ${messageId}`);
 
     const raw = readRawMessage(session.filePath, entry);
     parsed = await parseRawMessage(raw);
-    session.detailCache.set(index, parsed);
+    session.detailCache.set(globalIdx, parsed);
 
     // Limit detail cache size to prevent memory bloat
     if (session.detailCache.size > 200) {
@@ -499,16 +740,15 @@ export async function getMboxAttachmentBuffer(
   attachmentIndex: number
 ): Promise<{ buffer: Buffer; filename: string; mimeType: string }> {
   const session = getMboxSession(sessionId);
-  const index = parseInt(messageId.split('::')[1], 10);
+  const globalIdx = parseInt(messageId.split('::')[1], 10);
 
-  // Ensure the message is fully parsed
-  let parsed = session.detailCache.get(index);
+  let parsed = session.detailCache.get(globalIdx);
   if (!parsed) {
-    const entry = session.messageIndex[index];
+    const entry = session.messageIndex[globalIdx];
     if (!entry) throw new Error(`Message not found: ${messageId}`);
     const raw = readRawMessage(session.filePath, entry);
     parsed = await parseRawMessage(raw);
-    session.detailCache.set(index, parsed);
+    session.detailCache.set(globalIdx, parsed);
   }
 
   const att = parsed.attachments[attachmentIndex];
@@ -530,7 +770,6 @@ export async function searchMboxMessages(
   const results: EmailSummary[] = [];
   const lowerQuery = query.toLowerCase();
 
-  // Search across loaded summaries
   for (const [_idx, summary] of session.summaryCache) {
     if (results.length >= maxResults) break;
     if (
