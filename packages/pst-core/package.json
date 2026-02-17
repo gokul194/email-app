@@ -1,0 +1,32 @@
+{
+  "name": "@email-app/pst-core",
+  "version": "0.1.0",
+  "private": true,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "require": "./dist/index.js",
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "clean": "rimraf dist"
+  },
+  "dependencies": {
+    "@email-app/shared": "workspace:*",
+    "postal-mime": "^2.7.3",
+    "pst-extractor": "^1.12.0",
+    "uuid": "^10.0.0"
+  },
+  "devDependencies": {
+    "@email-app/tsconfig": "workspace:*",
+    "@types/node": "^25.2.3",
+    "@types/uuid": "^10.0.0",
+    "rimraf": "^6.0.0",
+    "typescript": "^5.7.0"
+  }
+}
