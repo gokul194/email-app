@@ -5,6 +5,7 @@ import { LoadingSpinner } from './LoadingSpinner';
 
 export function FileDropZone() {
   const [isDragging, setIsDragging] = useState(false);
+  const [filePath, setFilePath] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
   const provider = useDataProvider();
   const { isLoading, error, setSession, setLoading, setError } =
@@ -12,12 +13,43 @@ export function FileDropZone() {
 
   const handleFile = useCallback(
     async (file: File) => {
+      console.log('[FileDropZone] handleFile called:', file.name, file.size);
       setLoading(true);
       setError(null);
       try {
         const result = await provider.openPst(file);
+        console.log('[FileDropZone] openPst result:', result.sessionId, result.folders.length, 'folders');
         setSession(result.sessionId, result.folders);
       } catch (err) {
+        console.error('[FileDropZone] openPst error:', err);
+        setError(
+          err instanceof Error ? err.message : 'Failed to open file'
+        );
+      } finally {
+        setLoading(false);
+      }
+    },
+    [provider, setSession, setLoading, setError]
+  );
+
+  const handleFilePath = useCallback(
+    async (path: string) => {
+      const trimmed = path.trim();
+      if (!trimmed) return;
+      const lower = trimmed.toLowerCase();
+      if (!lower.endsWith('.pst') && !lower.endsWith('.mbox')) {
+        setError('Please enter a path to a .pst or .mbox file');
+        return;
+      }
+      console.log('[FileDropZone] handleFilePath called:', trimmed);
+      setLoading(true);
+      setError(null);
+      try {
+        const result = await provider.openPst(trimmed);
+        console.log('[FileDropZone] openPst result:', result.sessionId, result.folders.length, 'folders');
+        setSession(result.sessionId, result.folders);
+      } catch (err) {
+        console.error('[FileDropZone] openPst error:', err);
         setError(
           err instanceof Error ? err.message : 'Failed to open file'
         );
@@ -99,6 +131,32 @@ export function FileDropZone() {
           }}
         />
       </div>
+
+      {/* Local file path input for large files */}
+      <div className="mt-6 w-full max-w-lg">
+        <p className="mb-2 text-center text-xs text-gray-400">
+          For large files, paste the full file path:
+        </p>
+        <div className="flex gap-2">
+          <input
+            type="text"
+            value={filePath}
+            onChange={(e) => setFilePath(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') handleFilePath(filePath);
+            }}
+            placeholder="e.g. C:\Users\...\emails.pst"
+            className="flex-1 rounded-lg border border-gray-300 px-3 py-2 text-sm text-gray-700 placeholder-gray-400 focus:border-blue-400 focus:outline-none focus:ring-1 focus:ring-blue-400"
+          />
+          <button
+            onClick={() => handleFilePath(filePath)}
+            className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 active:bg-blue-800"
+          >
+            Open
+          </button>
+        </div>
+      </div>
+
       {error && (
         <p className="mt-4 text-sm text-red-500">{error}</p>
       )}

@@ -4,6 +4,7 @@ import type { PstFolder, EmailSummary, EmailDetail } from '@email-app/shared';
 interface EmailState {
   sessionId: string | null;
   isLoading: boolean;
+  isLoadingMore: boolean;
   error: string | null;
 
   folders: PstFolder[];
@@ -25,10 +26,12 @@ interface EmailState {
   setSession: (sessionId: string, folders: PstFolder[]) => void;
   setSelectedFolder: (folderId: string) => void;
   setMessages: (messages: EmailSummary[], total: number) => void;
+  appendMessages: (messages: EmailSummary[]) => void;
   setSelectedMessage: (message: EmailDetail | null) => void;
   setSearchQuery: (query: string) => void;
   setSearchResults: (results: EmailSummary[] | null) => void;
   setLoading: (loading: boolean) => void;
+  setLoadingMore: (loading: boolean) => void;
   setError: (error: string | null) => void;
   setIsSearching: (searching: boolean) => void;
   toggleSidebar: () => void;
@@ -39,6 +42,7 @@ interface EmailState {
 const initialState = {
   sessionId: null,
   isLoading: false,
+  isLoadingMore: false,
   error: null,
   folders: [],
   selectedFolderId: null,
@@ -65,6 +69,7 @@ export const useEmailStore = create<EmailState>((set) => ({
       selectedMessageId: null,
       selectedMessage: null,
       messages: [],
+      messageTotalCount: 0,
       searchResults: null,
       searchQuery: '',
       showMessageList: true,
@@ -72,6 +77,11 @@ export const useEmailStore = create<EmailState>((set) => ({
 
   setMessages: (messages, total) =>
     set({ messages, messageTotalCount: total }),
+
+  appendMessages: (newMessages) =>
+    set((state) => ({
+      messages: [...state.messages, ...newMessages],
+    })),
 
   setSelectedMessage: (message) =>
     set({
@@ -82,7 +92,8 @@ export const useEmailStore = create<EmailState>((set) => ({
   setSearchQuery: (query) => set({ searchQuery: query }),
   setSearchResults: (results) => set({ searchResults: results }),
   setLoading: (loading) => set({ isLoading: loading }),
-  setError: (error) => set({ error, isLoading: false }),
+  setLoadingMore: (loading) => set({ isLoadingMore: loading }),
+  setError: (error) => set(error ? { error, isLoading: false } : { error }),
   setIsSearching: (searching) => set({ isSearching: searching }),
   toggleSidebar: () => set((s) => ({ isSidebarOpen: !s.isSidebarOpen })),
   setShowMessageList: (show) => set({ showMessageList: show }),

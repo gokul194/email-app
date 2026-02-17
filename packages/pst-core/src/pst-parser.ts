@@ -7,12 +7,21 @@ import type {
   AttachmentInfo,
 } from '@email-app/shared';
 
+interface FolderState {
+  /** How many messages we've iterated so far */
+  loadedCount: number;
+  /** Whether we've finished iterating all messages */
+  fullyLoaded: boolean;
+}
+
 interface Session {
   pstFile: PSTFile;
   folderMap: Map<string, PSTFolder>;
-  /** Pre-cached summaries per folder to avoid re-iterating. */
+  /** Incrementally loaded summaries per folder */
   folderMessages: Map<string, EmailSummary[]>;
-  /** Cached native messages for detail lookups. */
+  /** Track how far we've iterated into each folder */
+  folderState: Map<string, FolderState>;
+  /** Cached native messages for detail lookups */
   messageCache: Map<string, PSTMessage>;
 }
 
@@ -60,6 +69,7 @@ export function openPstFile(filePath: string): {
     pstFile,
     folderMap,
     folderMessages: new Map(),
+    folderState: new Map(),
     messageCache: new Map(),
   });
 
@@ -67,20 +77,45 @@ export function openPstFile(filePath: string): {
 }
 
 /**
- * Load all message summaries for a folder (cached after first call).
+ * Load messages incrementally — only iterate enough to satisfy offset + limit.
+ * Subsequent calls continue from where we left off.
  */
-function loadFolderMessages(session: Session, folderId: string): EmailSummary[] {
-  const cached = session.folderMessages.get(folderId);
-  if (cached) return cached;
+function ensureFolderMessagesLoaded(
+  session: Session,
+  folderId: string,
+  needed: number
+): EmailSummary[] {
+  let summaries = session.folderMessages.get(folderId);
+  let state = session.folderState.get(folderId);
+
+  if (!summaries) {
+    summaries = [];
+    session.folderMessages.set(folderId, summaries);
+  }
+
+  if (!state) {
+    state = { loadedCount: 0, fullyLoaded: false };
+    session.folderState.set(folderId, state);
+  }
+
+  // Already have enough or fully loaded
+  if (state.fullyLoaded || summaries.length >= needed) {
+    return summaries;
+  }
 
   const native = session.folderMap.get(folderId);
   if (!native) throw new Error(`Folder not found: ${folderId}`);
 
-  const summaries: EmailSummary[] = [];
-  let msg: PSTMessage = native.getNextChild();
-  let index = 0;
+  // If this is the first time, initialize the cursor
+  if (state.loadedCount === 0) {
+    // moveToChildAt is not available, so we need to use getNextChild sequentially
+    // The folder's internal cursor tracks position
+  }
 
-  while (msg !== null) {
+  let msg: PSTMessage = native.getNextChild();
+  let index = state.loadedCount;
+
+  while (msg !== null && summaries.length < needed) {
     const messageId = `${folderId}::${index}`;
     session.messageCache.set(messageId, msg);
     summaries.push(mapToSummary(msg, messageId, folderId));
@@ -88,7 +123,12 @@ function loadFolderMessages(session: Session, folderId: string): EmailSummary[] 
     msg = native.getNextChild();
   }
 
-  session.folderMessages.set(folderId, summaries);
+  state.loadedCount = index;
+
+  if (msg === null) {
+    state.fullyLoaded = true;
+  }
+
   return summaries;
 }
 
@@ -99,10 +139,18 @@ export function getMessagesInFolder(
   limit = 50
 ): { messages: EmailSummary[]; total: number } {
   const session = getSession(sessionId);
-  const all = loadFolderMessages(session, folderId);
+
+  const native = session.folderMap.get(folderId);
+  if (!native) throw new Error(`Folder not found: ${folderId}`);
+  const total = native.contentCount;
+
+  // Only load as many messages as needed for this page
+  const needed = Math.min(offset + limit, total);
+  const all = ensureFolderMessagesLoaded(session, folderId, needed);
+
   return {
     messages: all.slice(offset, offset + limit),
-    total: all.length,
+    total,
   };
 }
 
@@ -175,9 +223,8 @@ export function searchMessages(
   const results: EmailSummary[] = [];
   const lowerQuery = query.toLowerCase();
 
-  // Search across all folders using cached summaries
-  for (const [folderId] of session.folderMap) {
-    const summaries = loadFolderMessages(session, folderId);
+  // Search across cached messages only (already loaded folders)
+  for (const [folderId, summaries] of session.folderMessages) {
     for (const summary of summaries) {
       if (results.length >= maxResults) return results;
 
@@ -211,10 +258,13 @@ function resolveMessage(session: Session, messageId: string): PSTMessage {
   const cached = session.messageCache.get(messageId);
   if (cached) return cached;
 
-  // Re-derive by loading the folder
-  const [folderId, indexStr] = messageId.split('::');
-  const targetIndex = parseInt(indexStr, 10);
-  loadFolderMessages(session, folderId);
+  // Need to load messages up to the requested index
+  const parts = messageId.split('::');
+  const folderId = parts[0];
+  const targetIndex = parseInt(parts[1], 10);
+
+  // Load enough messages to reach the target index
+  ensureFolderMessagesLoaded(session, folderId, targetIndex + 1);
 
   const msg = session.messageCache.get(messageId);
   if (!msg) throw new Error(`Message not found: ${messageId}`);

@@ -6,11 +6,12 @@ export class WebDataProvider implements DataProvider {
   async openPst(
     file: File | string
   ): Promise<{ sessionId: string; folders: PstFolder[] }> {
+    // String path — use local file path API (no upload, reads directly from disk)
     if (typeof file === 'string') {
-      throw new Error(
-        'File path not supported in web mode. Please provide a File object.'
-      );
+      return this.openByPath(file);
     }
+
+    // File object — upload via multipart
     const formData = new FormData();
     formData.append('pstFile', file);
 
@@ -21,6 +22,21 @@ export class WebDataProvider implements DataProvider {
     if (!res.ok) {
       const err = await res.json().catch(() => ({ error: res.statusText }));
       throw new Error(err.error || `Upload failed: ${res.statusText}`);
+    }
+    return res.json();
+  }
+
+  private async openByPath(
+    filePath: string
+  ): Promise<{ sessionId: string; folders: PstFolder[] }> {
+    const res = await fetch(`${API_BASE}/open-local`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filePath }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: res.statusText }));
+      throw new Error(err.error || `Failed to open file: ${res.statusText}`);
     }
     return res.json();
   }
