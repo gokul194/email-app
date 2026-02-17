@@ -1,0 +1,16 @@
+{
+  "name": "email-app",
+  "private": true,
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev --parallel",
+    "dev:web": "turbo run dev --filter=@email-app/web --filter=@email-app/server",
+    "dev:desktop": "turbo run dev --filter=@email-app/desktop",
+    "lint": "turbo run lint",
+    "clean": "turbo run clean"
+  },
+  "devDependencies": {
+    "turbo": "^2.3.0"
+  },
+  "packageManager": "pnpm@10.29.3"
+}
