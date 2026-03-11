@@ -1,0 +1,13 @@
+appId: com.emailapp.pstreader
+productName: PST Email Reader
+directories:
+  buildResources: build
+  output: release
+files:
+  - dist/**/*
+win:
+  target: nsis
+mac:
+  target: dmg
+linux:
+  target: AppImage
